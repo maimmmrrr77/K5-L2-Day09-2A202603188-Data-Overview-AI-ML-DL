@@ -27,13 +27,151 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
 import yaml  # noqa: F401
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    fixes = []
+    errors = [issue for issue in issues if issue.severity == ERROR]
+
+    remove_codes = {"CORRUPT_IMAGE", "BAD_SIZE", "LEAK_TEST"}
+    remove_issues = {}
+    for issue in errors:
+        if issue.code.startswith("DUP_IMAGE_") or issue.code in remove_codes:
+            remove_issues.setdefault(issue.image, issue)
+
+    removed_images = set()
+    for stem, issue in remove_issues.items():
+        image_path = ds.image_path(stem)
+        label_path = ds.label_path(stem)
+        existing_paths = [p for p in (image_path, label_path) if p is not None and p.exists()]
+        if not existing_paths:
+            continue
+        before = ", ".join(p.name for p in existing_paths)
+        for path in existing_paths:
+            path.unlink()
+        removed_images.add(stem)
+        fixes.append({
+            "image": stem,
+            "line": None,
+            "action": "remove_image",
+            "before": before,
+            "after": "",
+        })
+
+    needs_label_images = set()
+    for issue in errors:
+        if issue.code != "MISSING_LABEL_FILE" or issue.image in removed_images:
+            continue
+        if issue.image in needs_label_images:
+            continue
+        if ds.image_path(issue.image) is None or ds.label_path(issue.image).exists():
+            continue
+        needs_label_images.add(issue.image)
+        fixes.append({
+            "image": issue.image,
+            "line": None,
+            "action": "needs_label",
+            "before": "(không có file)",
+            "after": "chuyển người gán",
+        })
+
+    if any(issue.code == "BAD_CLASS_NAME" for issue in errors):
+        yaml_path = ds.yaml_path
+        before_text = yaml_path.read_text(encoding="utf-8") if yaml_path.exists() else ""
+        data = yaml.safe_load(before_text) if before_text else {}
+        if not isinstance(data, dict):
+            data = {}
+        data["names"] = dict(enumerate(cfg["classes"]))
+        after_text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+        if before_text != after_text:
+            yaml_path.write_text(after_text, encoding="utf-8")
+            fixes.append({
+                "image": "data.yaml",
+                "line": None,
+                "action": "rename_classes",
+                "before": before_text,
+                "after": after_text,
+            })
+
+    drop_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+    line_issues = defaultdict(dict)
+    for issue in errors:
+        if issue.image in removed_images or issue.line is None:
+            continue
+        if issue.code in drop_codes:
+            line_issues[issue.image][issue.line] = "drop_line"
+        elif issue.code == "BOX_OUT_OF_IMAGE":
+            line_issues[issue.image].setdefault(issue.line, "clip_box")
+
+    for stem, actions in line_issues.items():
+        label_path = ds.label_path(stem)
+        if not label_path.exists():
+            continue
+
+        original_text = label_path.read_text(encoding="utf-8")
+        original_lines = original_text.splitlines(keepends=True)
+        rewritten_lines = []
+        file_fixes = []
+
+        for line_number, raw_line in enumerate(original_lines, 1):
+            action = actions.get(line_number)
+            if action is None:
+                rewritten_lines.append(raw_line)
+                continue
+
+            line_text = raw_line.rstrip("\r\n")
+            if action == "drop_line":
+                file_fixes.append({
+                    "image": stem,
+                    "line": line_number,
+                    "action": "drop_line",
+                    "before": line_text,
+                    "after": "",
+                })
+                continue
+
+            class_id, cx, cy, width, height = parse_yolo_line(line_text)
+            left = max(cx - width / 2, 0.0)
+            right = min(cx + width / 2, 1.0)
+            top = max(cy - height / 2, 0.0)
+            bottom = min(cy + height / 2, 1.0)
+            if right <= left or bottom <= top:
+                file_fixes.append({
+                    "image": stem,
+                    "line": line_number,
+                    "action": "drop_line",
+                    "before": line_text,
+                    "after": "",
+                })
+                continue
+
+            clipped = (
+                class_id,
+                (left + right) / 2,
+                (top + bottom) / 2,
+                right - left,
+                bottom - top,
+            )
+            after = " ".join(
+                [str(clipped[0])] + [format(value, ".12g") for value in clipped[1:]]
+            )
+            ending = raw_line[len(line_text):]
+            rewritten_lines.append(after + ending)
+            file_fixes.append({
+                "image": stem,
+                "line": line_number,
+                "action": "clip_box",
+                "before": line_text,
+                "after": after,
+            })
+
+        if file_fixes:
+            label_path.write_text("".join(rewritten_lines), encoding="utf-8")
+            fixes.extend(file_fixes)
+
+    return fixes
